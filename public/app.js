@@ -57,25 +57,96 @@ walletModal.addEventListener('click', (e) => {
   if (e.target === walletModal) walletModal.classList.add('hidden');
 });
 
+function getInjectedSolana(walletName = '') {
+  const name = walletName.toLowerCase();
+  if (name.includes('trust')) {
+    return window.trustwallet?.solana || window.solana;
+  }
+  if (window.solana) return window.solana;
+  return window.trustwallet?.solana || null;
+}
+
+function pickSolanaAccount(accounts) {
+  return (
+    accounts.find((a) => (a.chains || []).some((c) => String(c).startsWith('solana:'))) ||
+    accounts[0]
+  );
+}
+
+async function connectInjected(wallet) {
+  const injected = getInjectedSolana(wallet?.name || '');
+  if (!injected?.connect) {
+    throw new Error('Trust Wallet Solana provider not found. Enable Solana in Trust Wallet, then refresh.');
+  }
+  const res = await injected.connect({ onlyIfTrusted: false });
+  const address =
+    res?.publicKey?.toString?.() ||
+    res?.publicKey?.toBase58?.() ||
+    injected.publicKey?.toString?.();
+  if (!address) {
+    throw new Error('Unable to find any account for 501. In Trust Wallet: add/enable the Solana network, open your SOL account, then try again.');
+  }
+  return { address, injected };
+}
+
 async function connect(wallet) {
   try {
-    const connectFeature = wallet.features['standard:connect'];
-    if (!connectFeature) throw new Error(`${wallet.name} does not support standard:connect`);
+    let address = null;
 
-    const { accounts } = await connectFeature.connect();
-    if (!accounts.length) throw new Error('No accounts returned — request may have been rejected');
+    const isTrust = /trust/i.test(wallet.name);
+    if (isTrust) {
+      try {
+        const injected = await connectInjected(wallet);
+        address = injected.address;
+        activeWallet = { ...wallet, _injected: injected.injected };
+      } catch (trustErr) {
+        console.warn('Trust injected connect failed, trying Wallet Standard', trustErr);
+      }
+    }
 
-    activeWallet = wallet;
-    activeAccount = accounts[0];
+    if (!address) {
+      const connectFeature = wallet.features['standard:connect'];
+      if (!connectFeature) throw new Error(`${wallet.name} does not support standard:connect`);
+
+      let result;
+      try {
+        result = await connectFeature.connect({
+          silent: false,
+          chains: ['solana:mainnet', 'solana:mainnet-beta', 'solana:devnet'],
+        });
+      } catch (e) {
+        result = await connectFeature.connect();
+      }
+
+      const accounts = result?.accounts || [];
+      const account = pickSolanaAccount(accounts);
+      if (!account?.address) {
+        throw new Error(
+          isTrust
+            ? 'Unable to find any account for 501. Enable Solana in Trust Wallet (Manage crypto → Solana), unlock, then reconnect.'
+            : 'No accounts returned — request may have been rejected'
+        );
+      }
+      activeWallet = wallet;
+      activeAccount = account;
+      address = account.address;
+    } else {
+      activeAccount = { address };
+    }
 
     walletModal.classList.add('hidden');
     connectBtn.classList.add('hidden');
     accountSection.classList.remove('hidden');
-    addressEl.textContent = activeAccount.address;
+    addressEl.textContent = address;
 
-    await loadPortfolio(activeAccount.address);
+    await loadPortfolio(address);
   } catch (err) {
-    alert(`Connection failed: ${err.message}`);
+    const msg = err?.message || String(err);
+    if (/501/.test(msg) || /unable to find any account/i.test(msg)) {
+      alert('Trust Wallet has no Solana account ready (error 501).\n\n1. Open Trust Wallet\n2. Manage crypto → enable Solana\n3. Open the SOL account\n4. Refresh this page and connect Trust again.\n\nPhantom or Solflare will also work.');
+      return;
+    }
+    alert(`Connection failed: ${msg}`);
   }
 }
 
