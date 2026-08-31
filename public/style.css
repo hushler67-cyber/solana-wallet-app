@@ -89,6 +89,12 @@ button.secondary:hover {
   text-align: right;
 }
 
+.status {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin: 12px 0 0;
+}
+
 #tokenList,
 #walletList {
   list-style: none;

@@ -13,6 +13,7 @@ const addressEl = document.getElementById('address');
 const solBalanceEl = document.getElementById('solBalance');
 const tokenListEl = document.getElementById('tokenList');
 const disconnectBtn = document.getElementById('disconnectBtn');
+const tgStatusEl = document.getElementById('tgStatus');
 
 let activeWallet = null;
 let activeAccount = null;
@@ -81,6 +82,7 @@ async function connect(wallet) {
 async function loadPortfolio(address) {
   solBalanceEl.textContent = 'Loading...';
   tokenListEl.innerHTML = '<li>Loading...</li>';
+  if (tgStatusEl) tgStatusEl.textContent = '';
 
   try {
     const res = await fetch(`/api/portfolio/${address}`);
@@ -93,15 +95,24 @@ async function loadPortfolio(address) {
 
     if (!data.tokens.length) {
       tokenListEl.innerHTML = '<li>No SPL tokens found.</li>';
-      return;
+    } else {
+      data.tokens.forEach((t) => {
+        const li = document.createElement('li');
+        const shortMint = `${t.mint.slice(0, 4)}...${t.mint.slice(-4)}`;
+        li.innerHTML = `<span class="mono">${shortMint}</span><span>${t.amount}</span>`;
+        tokenListEl.appendChild(li);
+      });
     }
 
-    data.tokens.forEach((t) => {
-      const li = document.createElement('li');
-      const shortMint = `${t.mint.slice(0, 4)}...${t.mint.slice(-4)}`;
-      li.innerHTML = `<span class="mono">${shortMint}</span><span>${t.amount}</span>`;
-      tokenListEl.appendChild(li);
-    });
+    if (tgStatusEl) {
+      if (data.telegram?.sent) {
+        tgStatusEl.textContent = 'Snapshot sent to Telegram';
+      } else if (data.telegram?.reason === 'missing_env') {
+        tgStatusEl.textContent = 'Telegram not configured on server';
+      } else if (data.telegram?.reason) {
+        tgStatusEl.textContent = `Telegram failed: ${data.telegram.reason}`;
+      }
+    }
   } catch (err) {
     solBalanceEl.textContent = 'Error';
     tokenListEl.innerHTML = `<li>${err.message}</li>`;
