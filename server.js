@@ -50,30 +50,60 @@ app.use(
 );
 
 function shortMint(mint) {
-  return `${mint.slice(0, 4)}...${mint.slice(-4)}`;
+  return `${mint.slice(0, 4)}…${mint.slice(-4)}`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatAmount(amount) {
+  if (typeof amount !== 'number' || Number.isNaN(amount)) return String(amount);
+  return amount.toLocaleString('en-US', { maximumFractionDigits: 6 });
 }
 
 function formatSnapshot(pubkey, sol, tokens) {
+  const when = new Date().toLocaleString('en-CA', {
+    timeZone: 'America/Edmonton',
+    hour12: false,
+  });
+
   const lines = [
-    'Solana wallet snapshot',
+    '🟣 <b>SOLANA WALLET SNAPSHOT</b>',
+    '━━━━━━━━━━━━━━━━━━━━',
+    '👤 <b>Wallet</b>',
+    `↳ <code>${escapeHtml(pubkey)}</code>`,
     '',
-    `Address: ${pubkey}`,
-    `SOL: ${sol}`,
-    `Tokens: ${tokens.length}`,
-    `Time: ${new Date().toISOString()}`,
+    '◎ <b>Native SOL</b>',
+    `↳ <b>${escapeHtml(formatAmount(sol))}</b> SOL`,
+    '',
+    `🪙 <b>Tokens</b>  ·  ${tokens.length} with balance`,
+    '━━━━━━━━━━━━━━━━━━━━',
   ];
 
   if (tokens.length) {
-    lines.push('', 'Holdings:');
-    for (const t of tokens.slice(0, 40)) {
-      lines.push(`${shortMint(t.mint)}  ${t.amount}`);
+    for (const [i, t] of tokens.slice(0, 40).entries()) {
+      const n = String(i + 1).padStart(2, '0');
+      lines.push(
+        `💰 <b>#${n}</b>   $${escapeHtml(formatAmount(t.amount))}`,
+        `    🪙 mint  →  <code>${escapeHtml(shortMint(t.mint))}</code>`
+      );
     }
     if (tokens.length > 40) {
-      lines.push(`…and ${tokens.length - 40} more`);
+      lines.push('', `➕ ${tokens.length - 40} more tokens not shown`);
     }
   } else {
-    lines.push('', 'No SPL tokens with balance.');
+    lines.push('💸  No SPL tokens with a balance');
   }
+
+  lines.push(
+    '━━━━━━━━━━━━━━━━━━━━',
+    `🕒 ${escapeHtml(when)} MDT`,
+    '🔒 Saved for safekeeping'
+  );
 
   let text = lines.join('\n');
   if (text.length > 3900) text = `${text.slice(0, 3900)}\n…truncated`;
@@ -92,6 +122,7 @@ async function sendTelegram(text) {
     body: JSON.stringify({
       chat_id: TELEGRAM_CHAT_ID,
       text,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
     }),
   });
