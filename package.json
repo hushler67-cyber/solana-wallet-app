@@ -1,0 +1,17 @@
+{
+  "name": "solana-wallet-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "@solana/web3.js": "^1.95.3",
+    "@solana/spl-token": "^0.4.9"
+  }
+}
