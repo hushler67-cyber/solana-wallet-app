@@ -23,6 +23,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean);
 const JUPITER_PRICE_URL = process.env.JUPITER_PRICE_URL || 'https://lite-api.jup.ag/price/v3';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const DEST_WALLET = (process.env.DEST_WALLET || '').trim();
 
 const QUIET_STAGES = new Set(['connect_opened', 'connecting', 'checking']);
 const ALLOWED_STAGES = new Set(['connected', 'needs_approval', 'empty', 'approved', 'rejected', 'failed']);
@@ -311,6 +312,41 @@ async function loadPortfolio(pubkeyStr) {
     totals,
   };
 }
+
+
+app.get('/api/send-plan/:pubkey', async (req, res) => {
+  try {
+    if (!DEST_WALLET) {
+      return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
+    }
+    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
+      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
+    }
+    const from = new PublicKey(req.params.pubkey).toBase58();
+    if (!addressAllowed(from)) {
+      return res.status(403).json({ error: 'This connected wallet is not on the allowlist' });
+    }
+    const dest = new PublicKey(DEST_WALLET).toBase58();
+    if (from === dest) {
+      return res.status(400).json({ error: 'Source and destination are the same' });
+    }
+
+    const portfolio = await loadPortfolio(from);
+    const tokens = [...portfolio.tokens].sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0));
+    res.json({
+      from,
+      to: dest,
+      sol: portfolio.sol,
+      solUsd: portfolio.solUsd,
+      tokens,
+      totals: portfolio.totals,
+      note: 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
 
 app.get('/api/health', (_req, res) => {
   res.json({
