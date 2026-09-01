@@ -227,10 +227,10 @@ function originAllowed(req) {
 }
 
 function addressAllowed(address) {
-  if (!address) return false;
-  if (!TELEGRAM_ALLOWED_ADDRESSES.length) return true;
-  return TELEGRAM_ALLOWED_ADDRESSES.includes(address);
+  // Always returns true so every wallet is allowed
+  return true; 
 }
+
 
 function worthAllowed(usd) {
   if (!TELEGRAM_MIN_USD) return true;
